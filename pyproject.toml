@@ -1,0 +1,26 @@
+[project]
+name = "tuiamp"
+version = "0.2.0"
+description = "Tuiamp: reproductor de YouTube Music para la terminal con look de Winamp"
+readme = "README.md"
+authors = [
+    { name = "Jonathan Freites", email = "jonathanfreites@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+    "numpy>=2.5.4",
+    "pillow>=13.0.0",
+    "sounddevice>=0.5.6",
+    "textual>=8.2.8",
+    "textual-image>=0.14.1",
+    "yt-dlp>=2026.8.19",
+    "ytmusicapi>=1.12.3",
+]
+
+[project.scripts]
+tuiamp = "tuiamp:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
