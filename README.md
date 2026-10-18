@@ -1,5 +1,7 @@
 # Tuiamp
 
+![tuimap interface](/screenshots/main-window.png)
+
 > *It really whips the llama's ass…* ahora en tu terminal.
 
 **Tuiamp** es un reproductor de **YouTube Music** para la terminal con el look de **Winamp 2.x**, hecho con [Textual](https://textual.textualize.io/).
