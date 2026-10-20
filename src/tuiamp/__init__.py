@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import subprocess
 import sys
 
 __version__ = "0.2.0"
@@ -42,6 +43,12 @@ def main() -> None:
 
     if not shutil.which("ffmpeg"):
         sys.exit("ffmpeg no está instalado. En macOS: brew install ffmpeg")
+    # Estar en el PATH no basta: tras un `brew upgrade` puede quedar enlazado a una
+    # librería que ya no existe (p. ej. libx265) y fallar en cada canción.
+    check = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
+    if check.returncode != 0:
+        detail = next((line.strip() for line in check.stderr.splitlines() if line.strip()), "")
+        sys.exit(f"ffmpeg está instalado pero no arranca: {detail}\nEn macOS: brew upgrade ffmpeg")
 
     from .api import YTMClient
     from .app import TuiampApp
