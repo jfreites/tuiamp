@@ -6,6 +6,10 @@ YouTube la cortaba y la reconexión de ffmpeg producía saltos audibles.
 
 Tener las muestras PCM en Python nos permite calcular el espectro (FFT) real
 para el visualizador, en lugar de una animación falsa.
+
+La salida no usa un callback de PortAudio: un hilo escritor llena una cola en C de
+~0.3 s que la tarjeta consume sin tocar el GIL, para que un parón del hilo de la UI
+(macOS lo deja sin CPU al mover ventanas o al pasar a otra app) no corte el audio.
 """
 
 from __future__ import annotations
@@ -26,6 +30,10 @@ CHANNELS = 2
 FRAME_BYTES = CHANNELS * 4  # float32
 SCOPE_FRAMES = 4096
 FFT_SIZE = 2048
+BLOCK_FRAMES = 1024
+# Latencia pedida a PortAudio. En CoreAudio, 0.1 deja ~0.25-0.4 s de audio en cola:
+# aguanta parones del GIL de ese orden y volumen/balance tardan eso en notarse.
+OUTPUT_LATENCY = 0.1
 
 
 class PCMBuffer:
@@ -266,7 +274,13 @@ class _Pipeline:
 
 
 class AudioEngine:
-    def __init__(self, volume: float = 0.8, balance: float = 0.0, buffer_seconds: float = 8.0) -> None:
+    def __init__(
+        self,
+        volume: float = 0.8,
+        balance: float = 0.0,
+        buffer_seconds: float = 8.0,
+        output_latency: float = OUTPUT_LATENCY,
+    ) -> None:
         self.volume = volume
         self.balance = balance  # -1 = izquierda, 0 = centro, 1 = derecha
         self._buffer_frames = int(buffer_seconds * SAMPLE_RATE)
@@ -280,25 +294,37 @@ class AudioEngine:
         self._af: str | None = None
         self._eq_timer: threading.Timer | None = None
         self._source: AudioDownload | None = None
-        self._frames_played = 0
+        self._frames_mixed = 0  # posición en la canción del próximo frame a mezclar
+        # Lo escrito desde el último vaciado de la cola (sin volumen aplicado): al pausar,
+        # lo que seguía en la cola se vuelve a escribir al reanudar (`_replay`).
+        self._history: deque[np.ndarray] = deque()
+        self._history_frames = 0
+        self._replay = np.zeros((0, CHANNELS), dtype=np.float32)
+        self._flush = False  # pide al hilo escritor vaciar la cola de salida
+        self._capacity = 0  # frames que caben en la cola de PortAudio; se mide al arrancar
+        self._closed = False
         self.paused = False
         self.finished = False
         self.buffering = False
         self.duration: float = 0.0
-        self.underruns = 0  # bloques que la tarjeta pidió y no llegaron a tiempo
+        self.underruns = 0  # veces que la cola de salida se vació en plena reproducción
         self.starved = 0  # bloques sin datos porque la red/ffmpeg no alcanzó
         self._scope = np.zeros(SCOPE_FRAMES, dtype=np.float32)
         self._window = np.hanning(FFT_SIZE).astype(np.float32)
         self._freqs = np.fft.rfftfreq(FFT_SIZE, 1 / SAMPLE_RATE)
+        # Sin callback: un hilo nuestro escribe en la cola de PortAudio y es el código C
+        # quien la vacía hacia la tarjeta, sin necesitar el GIL. Así, si macOS deja sin CPU
+        # al hilo de la UI (al mover ventanas o cambiar de app) y éste retiene el GIL, el
+        # audio aguanta lo que dure la cola (~0.3 s) en vez de los ~30 ms de un callback.
         self._stream = sd.OutputStream(
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
             dtype="float32",
-            blocksize=1024,
-            latency="high",  # más margen frente a pausas del GIL mientras la UI dibuja
-            callback=self._callback,
+            blocksize=BLOCK_FRAMES,
+            latency=output_latency,
         )
-        self._stream.start()
+        self._thread = threading.Thread(target=self._writer, daemon=True)
+        self._thread.start()
 
     # ── API pública ────────────────────────────────────────────────────────
     @property
@@ -312,7 +338,9 @@ class AudioEngine:
 
     @property
     def position(self) -> float:
-        return self._frames_played / SAMPLE_RATE
+        """Lo que suena ahora: lo mezclado menos lo que aún espera en las colas."""
+        pending = self._frames_mixed - len(self._replay) - self._queued()
+        return max(pending, 0) / SAMPLE_RATE
 
     @property
     def eq_filter(self) -> str | None:
@@ -353,29 +381,36 @@ class AudioEngine:
             self._eq_timer.start()
 
     def toggle_pause(self) -> None:
-        if self.active:
-            self.paused = not self.paused
+        with self._lock:
+            if self.active:
+                self.paused = not self.paused
+                if self.paused:
+                    self._flush = True  # silencio inmediato; lo encolado se guarda para reanudar
 
     def stop(self) -> None:
         with self._lock:
             self._kill()
             self._source = None
-            self._frames_played = 0
+            self._frames_mixed = 0
             self.finished = False
+            self._reset_output()
 
     def close(self) -> None:
         self.stop()
-        self._stream.stop()
+        self._closed = True
+        self._thread.join(timeout=2)
+        if self._stream.active:
+            self._stream.abort()
         self._stream.close()
 
     def waveform(self, n: int) -> np.ndarray:
-        return self._scope[-n:].copy()
+        return self._audible(n).copy()
 
     def spectrum(self, bands: int, fmin: float = 40.0, fmax: float = 16_000.0) -> np.ndarray:
         """Magnitudes por banda (escala logarítmica de frecuencias), normalizadas a 0..1."""
         if bands <= 0:
             return np.zeros(0, dtype=np.float32)
-        samples = self._scope[-FFT_SIZE:] * self._window
+        samples = self._audible(FFT_SIZE) * self._window
         mag = np.abs(np.fft.rfft(samples)) / (self._window.sum() / 2)
         edges = np.geomspace(fmin, fmax, bands + 1)
         idx = np.searchsorted(self._freqs, edges)
@@ -400,15 +435,23 @@ class AudioEngine:
                 pipe.close()
         self._pipe = self._pending = self._fading = None
 
+    def _reset_output(self) -> None:
+        """Descarta lo encolado de la canción anterior (seek, stop, cambio de canción)."""
+        self._history.clear()
+        self._history_frames = 0
+        self._replay = np.zeros((0, CHANNELS), dtype=np.float32)
+        self._flush = True
+
     def _start(self, start: float) -> None:
         self._kill()
-        self._frames_played = int(start * SAMPLE_RATE)
+        self._frames_mixed = int(start * SAMPLE_RATE)
         self.finished = False
         self.buffering = True
-        self._pipe = self._spawn(self._frames_played)
+        self._reset_output()
+        self._pipe = self._spawn(self._frames_mixed)
 
     def _swap_filter(self) -> None:
-        """Arranca un ffmpeg con el EQ nuevo en la posición actual; el callback hace el relevo."""
+        """Arranca un ffmpeg con el EQ nuevo en la posición actual; el escritor hace el relevo."""
         with self._lock:
             self._eq_timer = None
             pipe = self._pipe
@@ -419,7 +462,7 @@ class AudioEngine:
                 self._pending = None
             if pipe.eof and pipe.buf.frames == 0:
                 return  # la canción ya terminó
-            self._pending = self._spawn(self._frames_played)
+            self._pending = self._spawn(self._frames_mixed)
 
     def _spawn(self, start_frame: int) -> _Pipeline:
         start = start_frame / SAMPLE_RATE
@@ -492,29 +535,23 @@ class AudioEngine:
         pipe.eof = True
 
     def _try_swap(self, frames: int) -> None:
-        """Relevo del pipeline con el EQ nuevo, alineado a la muestra con lo que suena."""
-        # Nunca bloquear el hilo de audio: si el hilo de UI tiene el lock, se reintenta luego.
-        if not self._lock.acquire(blocking=False):
+        """Relevo del pipeline con el EQ nuevo, alineado a la muestra con lo mezclado."""
+        pend = self._pending
+        if pend is None:
             return
-        try:
-            pend = self._pending
-            if pend is None:
-                return
-            behind = self._frames_played - pend.start_frame - pend.dropped
-            if behind > 0:
-                pend.dropped += pend.buf.discard(behind)
-                behind = self._frames_played - pend.start_frame - pend.dropped
-            if behind <= 0 and pend.buf.frames >= XFADE_FRAMES + frames:
-                if self._fading is not None:
-                    self._fading.buf.close()
-                self._fading, self._fade_pos = self._pipe, 0
-                self._pipe, self._pending = pend, None
-            elif pend.eof:
-                # Llegó al final sin alcanzar la posición (canción terminando): se descarta.
-                pend.buf.close()
-                self._pending = None
-        finally:
-            self._lock.release()
+        behind = self._frames_mixed - pend.start_frame - pend.dropped
+        if behind > 0:
+            pend.dropped += pend.buf.discard(behind)
+            behind = self._frames_mixed - pend.start_frame - pend.dropped
+        if behind <= 0 and pend.buf.frames >= XFADE_FRAMES + frames:
+            if self._fading is not None:
+                self._fading.buf.close()
+            self._fading, self._fade_pos = self._pipe, 0
+            self._pipe, self._pending = pend, None
+        elif pend.eof:
+            # Llegó al final sin alcanzar la posición (canción terminando): se descarta.
+            pend.buf.close()
+            self._pending = None
 
     def _crossfade(self, fading: _Pipeline, data: np.ndarray) -> np.ndarray:
         n = len(data)
@@ -529,35 +566,123 @@ class AudioEngine:
             self._fading = None
         return out
 
-    def _callback(self, outdata: np.ndarray, frames: int, _time, status) -> None:
-        if status.output_underflow:
-            self.underruns += 1
-        if self._pipe is None or self.paused:
-            outdata.fill(0)
-            self._scope *= 0.85  # decaimiento suave del visualizador en pausa
-            return
+    # ── Salida: hilo escritor ──────────────────────────────────────────────
+    def _queued(self) -> int:
+        """Frames escritos en PortAudio que todavía no han sonado (0 si se está vaciando)."""
+        return 0 if self._flush else self._ring_frames()
+
+    def _ring_frames(self) -> int:
+        if not self._capacity or not self._stream.active:
+            return 0
+        try:
+            free = self._stream.write_available
+        except sd.PortAudioError:
+            return 0
+        return min(max(self._capacity - free, 0), self._capacity)
+
+    def _audible(self, n: int) -> np.ndarray:
+        """Las últimas `n` muestras que ya suenan: el scope va por delante lo que hay en cola."""
+        scope = self._scope
+        lag = min(self._queued(), len(scope) - n)
+        return scope[len(scope) - lag - n: len(scope) - lag]
+
+    def _measure_capacity(self) -> None:
+        # Al arrancar, PortAudio llena la cola de silencio; cuando se vacía,
+        # el hueco libre máximo es su capacidad.
+        stream = self._stream
+        stream.start()
+        capacity = 0
+        deadline = time.monotonic() + 0.6
+        while time.monotonic() < deadline and not self._closed:
+            capacity = max(capacity, stream.write_available)
+            time.sleep(0.01)
+        with self._lock:
+            self._capacity = capacity
+            self._scope = np.zeros(SCOPE_FRAMES + capacity, dtype=np.float32)
+
+    def _flush_output(self) -> bool:
+        """Prepara el vaciado de la cola. Si es una pausa, guarda lo encolado para reanudar.
+
+        Devuelve True si hay que abortar el stream (fuera del lock: tarda ~0.1 s).
+        """
+        queued = self._ring_frames()
+        if not queued:
+            self._flush = False
+            return False  # ya estaba vacía: abortar solo añadiría el silencio inicial de PortAudio
+        if self.paused and self._history_frames:
+            tail = np.concatenate(self._history)[-queued:]
+            self._replay = np.concatenate((tail, self._replay))
+        self._history.clear()
+        self._history_frames = 0
+        return True
+
+    def _remember(self, data: np.ndarray) -> None:
+        self._history.append(data)
+        self._history_frames += len(data)
+        while self._history and self._history_frames - len(self._history[0]) >= self._capacity:
+            self._history_frames -= len(self._history.popleft())
+
+    def _mix(self, frames: int) -> np.ndarray | None:
         if self._pending is not None:
             self._try_swap(frames)
         pipe = self._pipe
-        if pipe is None:
-            outdata.fill(0)
-            return
+        assert pipe is not None
         buf = pipe.buf
         data = buf.get(frames)
         n = len(data)
         fading = self._fading
         if fading is not None and n:
             data = self._crossfade(fading, data)
-        bal = self.balance
-        gains = np.array([min(1.0, 1.0 - bal), min(1.0, 1.0 + bal)], dtype=np.float32)
-        outdata[:n] = data * (gains * self.volume)
-        outdata[n:] = 0
-        self._frames_played += n
+        self._frames_mixed += n
         if n:
             # Swap atómico: el hilo de UI nunca ve un buffer a medio escribir.
-            self._scope = np.concatenate((self._scope[n:], data.mean(axis=1)))[-SCOPE_FRAMES:]
+            scope = self._scope
+            self._scope = np.concatenate((scope[n:], data.mean(axis=1)))[-len(scope):]
         self.buffering = n == 0 and not pipe.eof
         if n < frames and not pipe.eof:
             self.starved += 1
-        if n < frames and pipe.eof and buf.frames == 0:
-            self.finished = True
+        if n == 0 and pipe.eof and buf.frames == 0 and self._queued() == 0:
+            self.finished = True  # solo cuando ya sonó también lo que estaba en cola
+        return data if n else None
+
+    def _next_block(self) -> np.ndarray | None:
+        """El siguiente bloque a escribir, con volumen y balance, o None si no hay nada."""
+        if self._pipe is None or self.paused:
+            self._scope *= 0.92  # decaimiento suave del visualizador en pausa
+            return None
+        if len(self._replay):
+            data, self._replay = self._replay[:BLOCK_FRAMES], self._replay[BLOCK_FRAMES:]
+        else:
+            data = self._mix(BLOCK_FRAMES)
+            if data is None:
+                return None
+        self._remember(data)
+        bal = self.balance
+        gains = np.array([min(1.0, 1.0 - bal), min(1.0, 1.0 + bal)], dtype=np.float32)
+        return data * (gains * self.volume)
+
+    def _writer(self) -> None:
+        """Único hilo que toca el stream: mezcla bloques y los escribe en la cola de PortAudio."""
+        self._measure_capacity()
+        stream = self._stream
+        idle = True
+        while not self._closed:
+            with self._lock:
+                abort = self._flush and self._flush_output()
+                block = None if abort else self._next_block()
+            if abort:
+                stream.abort()
+                # Una petición que llegara durante el abort ya queda cumplida: la cola está vacía.
+                self._flush = False
+                continue
+            if block is None:
+                idle = True
+                time.sleep(0.01)
+                continue
+            if not stream.active:
+                stream.start()
+                idle = True  # el primer write tras arrancar siempre informa underflow
+            # write() bloquea (sin el GIL) mientras la cola está llena.
+            if stream.write(block) and not idle:
+                self.underruns += 1
+            idle = False
